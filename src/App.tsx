@@ -13,10 +13,15 @@ import {
   Cpu,
   Play,
   X,
-  Check
+  Check,
+  Globe,
+  Copy,
+  LogOut
 } from 'lucide-react';
 import { cn } from './lib/utils';
 import { SKINS, Skin, PieceType, PieceColor } from './constants/skins';
+import { db } from './lib/firebase';
+import { ref, onValue, set, update } from 'firebase/database';
 
 // --- Types ---
 type Square = string;
@@ -106,6 +111,108 @@ export default function App() {
   const [bonusMovePiece, setBonusMovePiece] = useState<Square | null>(null);
   const [mana, setMana] = useState<{ w: number; b: number }>({ w: 1, b: 1 });
   const [gameOver, setGameOver] = useState<{ winner: string | null; reason: string } | null>(null);
+
+  // --- Multiplayer State ---
+  const [roomId, setRoomId] = useState<string | null>(null);
+  const [playerRole, setPlayerRole] = useState<PieceColor | null>(null);
+  const [isMultiplayer, setIsMultiplayer] = useState(false);
+  const [roomInput, setRoomInput] = useState('');
+
+  // --- Persistence ---
+  useEffect(() => {
+    const savedSkins = localStorage.getItem('chess_skins');
+    if (savedSkins) {
+      try {
+        setPieceSkins(JSON.parse(savedSkins));
+      } catch (e) {
+        console.error("Failed to load skins", e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('chess_skins', JSON.stringify(pieceSkins));
+  }, [pieceSkins]);
+
+  // --- Firebase Sync ---
+  useEffect(() => {
+    if (!roomId) return;
+
+    const roomRef = ref(db, `rooms/${roomId}`);
+    const unsubscribe = onValue(roomRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        if (data.fen !== game.fen()) {
+          setGame(new Chess(data.fen));
+        }
+        if (JSON.stringify(data.mana) !== JSON.stringify(mana)) {
+          setMana(data.mana);
+        }
+        if (JSON.stringify(data.moveHistory) !== JSON.stringify(moveHistory)) {
+          setMoveHistory(data.moveHistory || []);
+        }
+        if (data.bonusMovePiece !== bonusMovePiece) {
+          setBonusMovePiece(data.bonusMovePiece);
+        }
+        if (data.gameOver && JSON.stringify(data.gameOver) !== JSON.stringify(gameOver)) {
+          setGameOver(data.gameOver);
+        }
+        // Sync skins if they are shared or just use local? 
+        // Let's sync them so both players see the same "custom" game
+        if (JSON.stringify(data.pieceSkins) !== JSON.stringify(pieceSkins)) {
+          setPieceSkins(data.pieceSkins);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, [roomId, game, mana, moveHistory, bonusMovePiece, gameOver, pieceSkins]);
+
+  const syncToFirebase = useCallback((updates: any) => {
+    if (!roomId) return;
+    const roomRef = ref(db, `rooms/${roomId}`);
+    update(roomRef, updates);
+  }, [roomId]);
+
+  const createRoom = () => {
+    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const initialData = {
+      fen: new Chess().fen(),
+      mana: { w: 1, b: 1 },
+      moveHistory: [],
+      pieceSkins,
+      bonusMovePiece: null,
+      gameOver: null,
+      createdAt: Date.now()
+    };
+    set(ref(db, `rooms/${newRoomId}`), initialData);
+    setRoomId(newRoomId);
+    setPlayerRole('w');
+    setIsMultiplayer(true);
+    setGameState('playing');
+  };
+
+  const joinRoom = (id: string) => {
+    const roomRef = ref(db, `rooms/${id}`);
+    onValue(roomRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setRoomId(id);
+        setPlayerRole('b');
+        setIsMultiplayer(true);
+        setGameState('playing');
+      } else {
+        alert("Room not found!");
+      }
+    }, { onlyOnce: true });
+  };
+
+  const leaveRoom = () => {
+    setRoomId(null);
+    setPlayerRole(null);
+    setIsMultiplayer(false);
+    setGameState('title');
+    resetGame();
+  };
 
   // --- Game Logic ---
 
@@ -269,6 +376,11 @@ export default function App() {
       const skinId = pieceSkins[piece.type as PieceType];
       const playerColor = piece.color;
       
+      // Multiplayer check: Only move your own pieces
+      if (isMultiplayer && playerRole && playerColor !== playerRole) return false;
+      // Multiplayer check: Only move on your turn
+      if (isMultiplayer && game.turn() !== playerRole) return false;
+
       // Check for Wood protection (Now costs 1 mana to trigger)
       const targetPiece = game.get(move.to as any);
       if (targetPiece) {
@@ -425,21 +537,39 @@ export default function App() {
           else if (game.isThreefoldRepetition()) reason = 'Threefold Repetition';
           else if (game.isInsufficientMaterial()) reason = 'Insufficient Material';
 
-          setGameOver({
+          const overData = {
             winner: game.turn() === 'b' ? 'White' : 'Black',
             reason
+          };
+          setGameOver(overData);
+          if (isMultiplayer) syncToFirebase({ gameOver: overData });
+        }
+
+        if (isMultiplayer) {
+          syncToFirebase({
+            fen: game.fen(),
+            mana: {
+              w: nextTurn === 'w' ? Math.min(5, mana.w + 1) : mana.w,
+              b: nextTurn === 'b' ? Math.min(5, mana.b + 1) : mana.b
+            },
+            moveHistory: [...moveHistory, result!.san],
+            bonusMovePiece: canBonus && !bonusMovePiece ? result!.to : null,
+            pieceSkins // Sync skins so both see the same
           });
         }
+
         return true;
       }
     } catch (e) {
+      console.error("Move error", e);
       return false;
     }
     return false;
-  }, [game, pieceSkins, bonusMovePiece, triggerEffect, getSpecialMoves, mana]);
+  }, [game, pieceSkins, bonusMovePiece, triggerEffect, getSpecialMoves, mana, isMultiplayer, playerRole, syncToFirebase, moveHistory]);
 
   const onSquareClick = (square: Square) => {
     if (gameOver) return;
+    if (isMultiplayer && game.turn() !== playerRole) return;
 
     if (selectedSquare === square) {
       setSelectedSquare(null);
@@ -507,12 +637,17 @@ export default function App() {
     const rows = [];
     const boardData = game.board();
     
+    const isFlipped = playerRole === 'b';
+
     for (let i = 0; i < 8; i++) {
       const row = [];
       for (let j = 0; j < 8; j++) {
-        const squareName = `${String.fromCharCode(97 + j)}${8 - i}`;
-        const piece = boardData[i][j];
-        const isDark = (i + j) % 2 === 1;
+        const displayI = isFlipped ? 7 - i : i;
+        const displayJ = isFlipped ? 7 - j : j;
+
+        const squareName = `${String.fromCharCode(97 + displayJ)}${8 - displayI}`;
+        const piece = boardData[displayI][displayJ];
+        const isDark = (displayI + displayJ) % 2 === 1;
         const isSelected = selectedSquare === squareName;
         
         // Check if this square is a valid move for the selected piece
@@ -558,20 +693,20 @@ export default function App() {
             </AnimatePresence>
             
             {/* Coordinates */}
-            {j === 0 && (
+            {displayJ === (isFlipped ? 7 : 0) && (
               <span className={cn(
                 "absolute top-0.5 left-0.5 text-[10px] font-bold",
                 isDark ? "text-[#eeeed2]" : "text-[#769656]"
               )}>
-                {8 - i}
+                {8 - displayI}
               </span>
             )}
-            {i === 7 && (
+            {displayI === (isFlipped ? 0 : 7) && (
               <span className={cn(
                 "absolute bottom-0.5 right-0.5 text-[10px] font-bold",
                 isDark ? "text-[#eeeed2]" : "text-[#769656]"
               )}>
-                {String.fromCharCode(97 + j)}
+                {String.fromCharCode(97 + displayJ)}
               </span>
             )}
           </div>
@@ -580,7 +715,7 @@ export default function App() {
       rows.push(<div key={i} className="flex">{row}</div>);
     }
     return rows;
-  }, [game, selectedSquare, pieceSkins]);
+  }, [game, selectedSquare, pieceSkins, playerRole, activeEffects, onSquareClick, getSpecialMoves]);
 
   if (gameState === 'title') {
     return (
@@ -614,13 +749,43 @@ export default function App() {
 
           <div className="flex flex-col gap-4 w-full">
             <button 
-              onClick={() => setGameState('playing')}
+              onClick={() => {
+                setIsMultiplayer(false);
+                setGameState('playing');
+              }}
               className="group relative w-full py-5 bg-emerald-500 hover:bg-emerald-400 text-white font-black text-xl rounded-2xl transition-all shadow-xl shadow-emerald-500/20 flex items-center justify-center gap-3 overflow-hidden"
             >
               <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
               <Play className="w-6 h-6 fill-current relative z-10" />
-              <span className="relative z-10">PLAY GAME</span>
+              <span className="relative z-10">LOCAL PLAY</span>
             </button>
+
+            <div className="grid grid-cols-2 gap-4">
+              <button 
+                onClick={createRoom}
+                className="py-4 bg-zinc-800 hover:bg-zinc-700 text-white font-bold rounded-2xl transition-all border border-white/5 flex items-center justify-center gap-2"
+              >
+                <Globe className="w-5 h-5 text-emerald-400" />
+                CREATE 1v1
+              </button>
+              <div className="relative">
+                <input 
+                  type="text"
+                  placeholder="ROOM CODE"
+                  value={roomInput}
+                  onChange={(e) => setRoomInput(e.target.value.toUpperCase())}
+                  className="w-full h-full bg-zinc-900 border border-white/10 rounded-2xl px-4 text-sm font-bold focus:outline-none focus:border-emerald-500/50 transition-all"
+                />
+                {roomInput.length >= 6 && (
+                  <button 
+                    onClick={() => joinRoom(roomInput)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-emerald-500 rounded-xl hover:bg-emerald-400 transition-colors"
+                  >
+                    <Play className="w-4 h-4 fill-current" />
+                  </button>
+                )}
+              </div>
+            </div>
 
             <button 
               onClick={() => setShowSkinSelector(true)}
@@ -722,6 +887,21 @@ export default function App() {
         </div>
         
         <div className="flex items-center gap-4">
+          {roomId && (
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+              <span className="text-[10px] font-bold text-emerald-500/50 uppercase tracking-widest">Room</span>
+              <span className="text-sm font-mono font-bold text-emerald-500">{roomId}</span>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(roomId);
+                }}
+                className="p-1 hover:bg-emerald-500/20 rounded transition-colors"
+                title="Copy Room ID"
+              >
+                <Copy className="w-3 h-3 text-emerald-500" />
+              </button>
+            </div>
+          )}
           <button 
             onClick={() => setShowSkinSelector(true)}
             className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors text-sm font-medium border border-white/5"
@@ -730,11 +910,11 @@ export default function App() {
             Skins
           </button>
           <button 
-            onClick={resetGame}
+            onClick={isMultiplayer ? leaveRoom : resetGame}
             className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors border border-white/5"
-            title="Reset Game"
+            title={isMultiplayer ? "Leave Room" : "Reset Game"}
           >
-            <RotateCcw className="w-5 h-5" />
+            {isMultiplayer ? <LogOut className="w-5 h-5 text-red-400" /> : <RotateCcw className="w-5 h-5" />}
           </button>
         </div>
       </header>
@@ -749,8 +929,8 @@ export default function App() {
                 <Cpu className="w-5 h-5 text-zinc-400" />
               </div>
               <div>
-                <p className="text-sm font-bold">Deep Blue v2</p>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Level 1500</p>
+                <p className="text-sm font-bold">{isMultiplayer ? "Opponent" : "Deep Blue v2"}</p>
+                <p className="text-[10px] text-zinc-500 uppercase tracking-wider">{isMultiplayer ? "Multiplayer" : "Level 1500"}</p>
               </div>
             </div>
             <div className="px-3 py-1 bg-zinc-800 rounded text-sm font-mono text-zinc-400 border border-white/5">
@@ -799,7 +979,7 @@ export default function App() {
                 <User className="w-5 h-5 text-emerald-500" />
               </div>
               <div>
-                <p className="text-sm font-bold">You</p>
+                <p className="text-sm font-bold">You {playerRole && `(${playerRole === 'w' ? 'White' : 'Black'})`}</p>
                 <p className="text-[10px] text-emerald-500/70 uppercase tracking-wider">Challenger</p>
               </div>
             </div>
