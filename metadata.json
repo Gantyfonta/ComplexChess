@@ -1,0 +1,5 @@
+{
+  "name": "SkinChess",
+  "description": "A customizable Chess game with unlockable and equippable piece skins.",
+  "requestFramePermissions": []
+}
